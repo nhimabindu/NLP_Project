@@ -221,15 +221,16 @@ hr { border-color: var(--border) !important; }
 def _badge(label, kind):
     return f'<span class="badge badge-{kind}">{label}</span>'
 
-
 def render_intel_card(frame, title, meta_html, extra_html=""):
     st.markdown(f"""
     <div class="intel-card {frame.lower()}">
         <div class="intel-title">{title}</div>
         <div class="intel-meta">{meta_html}</div>
-        {extra_html}
     </div>
     """, unsafe_allow_html=True)
+
+    if extra_html:
+        st.markdown(extra_html, unsafe_allow_html=True)
 
 
 def plotly_theme(fig, height=300, showlegend=True):
@@ -293,12 +294,7 @@ CATEGORY_KEYWORDS = {
         "impact": ["Market Expansion", "Capability Access", "Risk Sharing"],
         "frame": ["Opportunity"],
     },
-    "risk_tariff": {
-        "keywords": ["tariff", "customs", "trade war", "regulation", "regulatory"],
-        "recommendation": "Diversify supply chains to reduce tariff and regulatory exposure.",
-        "impact": ["Reduced Regulatory Risk", "Business Continuity", "Supply Chain Resilience"],
-        "frame": ["Risk"],
-    },
+
     "ai": {
         "keywords": ["artificial intelligence", "\\bai\\b", "machine learning",
                      "ai agent", "ai-powered", "ai-driven", "predictive analytics"],
@@ -309,12 +305,6 @@ CATEGORY_KEYWORDS = {
 }
 
 RISK_SIGNAL_KEYWORDS = {
-    # Tuned against a direct corpus-wide keyword count (not semantic search)
-    # run 2026-06-20: tariff=17 docs, customs=6, regulation+regulatory=3,
-    # layoff=2, strike=2, disrupt/shortage/delay/rival=1 each. competitor,
-    # lawsuit, fine, penalty, backlash, criticism = 0 hits — dropped, since
-    # keeping zero-hit words adds noise without ever contributing signal.
-    "regulatory": ["tariff", "customs", "regulation", "regulatory", "trade war"],
     "negative_sentiment": ["layoff", "job cut", "strike", "disrupt"],
     "supply_chain": ["shortage", "delay", "bottleneck", "port congestion"],
 }
@@ -467,7 +457,6 @@ TOPIC_QUERIES = [
     "DHL sustainability strategy",
     "DHL strategic partnerships",
     "DHL AI analytics machine learning",
-    "DHL tariffs trade regulation",
     "DHL supply chain disruption",
 ]
 
@@ -595,14 +584,14 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         [
-            "1 · Company Overview",
-            "2 · Market Intelligence",
-            "3 · Opportunity Monitor",
-            "4 · Risk Monitor",
-            "5 · Trend Monitor",
-            "6 · Sentiment Analysis",
-            "7 · Strategic Recommendations",
-            "8 · CEO Briefing",
+            "🏢 1 · Company Overview",
+            "📰 2 · Market Intelligence",
+            "🚀 3 · Opportunity Monitor",
+            "⚠️ 4 · Risk Monitor",
+            "📊 5 · Trend Monitor",
+            "💬 6 · Sentiment Analysis",
+            "🎯 7 · Strategic Recommendations",
+            "🧑‍💼 8 · CEO Briefing",
         ],
         label_visibility="collapsed",
     )
@@ -622,19 +611,27 @@ st.markdown("<br>", unsafe_allow_html=True)
 # =========================================================
 # SECTION 1: Company Overview
 # =========================================================
-if page == "1 · Company Overview":
-    st.markdown('<div class="section-title">1 &middot; Company Overview</div>', unsafe_allow_html=True)
+if page == "🏢 1 · Company Overview":
+    st.markdown('<div class="section-title">🏢 1 &middot; Company Overview</div>', unsafe_allow_html=True)
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Company", "DHL Group")
-    col2.metric("Industry", "Logistics")
-    col3.metric("Documents", collection.count())
-    col4.metric("Data Sources", "3+")
-    col5.metric("Last Scan", datetime.datetime.now().strftime("%H:%M, %d %b"))
+    col1.metric("🏷️ Company", "DHL Group")
+    col2.metric("🏭 Industry", "Logistics")
+    col3.metric("📄 Documents", collection.count())
+    col4.metric("🔗 Data Sources", "3+")
+    col5.metric("⏱️ Last Scan", datetime.datetime.now().strftime("%H:%M, %d %b"))
 
-    agg_scores = {cat: 0 for cat in CATEGORY_KEYWORDS}
+    # risk_tariff is excluded here: this chart aggregates scores from the 8
+    # opportunity/trend-focused topic queries, none of which are tariff-
+    # specific, so it always shows near-zero here regardless of actual
+    # tariff content in the corpus. Real tariff/risk signal strength is
+    # measured separately in Risk Monitor via the corpus-wide direct scan
+    # (run_corpus_wide_risk_scan), which checks every document directly
+    # rather than relying on these 8 queries' semantic retrieval.
+    agg_scores = {cat: 0 for cat in CATEGORY_KEYWORDS if cat != "risk_tariff"}
     for q_scores in scores_by_query.values():
         for cat, info in q_scores.items():
-            agg_scores[cat] += info["score"]
+            if cat in agg_scores:
+                agg_scores[cat] += info["score"]
 
     cov_fig = go.Figure(data=[go.Bar(
         x=list(agg_scores.values()),
@@ -642,16 +639,16 @@ if page == "1 · Company Overview":
         orientation="h",
         marker_color=PALETTE["Trend"],
     )])
-    cov_fig.update_layout(title="Corpus Coverage by Topic (total signal strength)")
+    cov_fig.update_layout(title="📊 Corpus Coverage by Topic (total signal strength)")
     st.plotly_chart(plotly_theme(cov_fig, height=280, showlegend=False), use_container_width=True)
 
 # =========================================================
 # SECTION 2: Market Intelligence
 # =========================================================
-if page == "2 · Market Intelligence":
-    st.markdown('<div class="section-title">2 &middot; Market Intelligence</div>', unsafe_allow_html=True)
+if page == "📰 2 · Market Intelligence":
+    st.markdown('<div class="section-title">📰 2 &middot; Market Intelligence</div>', unsafe_allow_html=True)
     mi_tab1, mi_tab2, mi_tab3, mi_tab4 = st.tabs(
-        ["Recent News", "Competitor Activity", "Emerging Tech", "Announcements"]
+        ["📰 Recent News", "⚔️ Competitor Activity", "🔬 Emerging Tech", "📢 Announcements"]
     )
 
     with mi_tab1:
@@ -677,8 +674,8 @@ if page == "2 · Market Intelligence":
 # =========================================================
 # SECTION 3: Opportunity Monitor
 # =========================================================
-if page == "3 · Opportunity Monitor":
-    st.markdown('<div class="section-title">3 &middot; Opportunity Monitor</div>', unsafe_allow_html=True)
+if page == "🚀 3 · Opportunity Monitor":
+    st.markdown('<div class="section-title">🚀 3 &middot; Opportunity Monitor</div>', unsafe_allow_html=True)
 
     if opportunities:
         opp_col1, opp_col2 = st.columns([1.3, 1])
@@ -698,7 +695,7 @@ if page == "3 · Opportunity Monitor":
                 orientation="h",
                 marker_color=PALETTE["Opportunity"],
             )])
-            opp_fig.update_layout(title="Opportunity Confidence", xaxis_title="Confidence ratio")
+            opp_fig.update_layout(title="📈 Opportunity Confidence", xaxis_title="Confidence ratio")
             st.plotly_chart(plotly_theme(opp_fig, height=320, showlegend=False), use_container_width=True)
 
         with st.expander("View supporting evidence"):
@@ -712,8 +709,8 @@ if page == "3 · Opportunity Monitor":
 # =========================================================
 # SECTION 4: Risk Monitor
 # =========================================================
-if page == "4 · Risk Monitor":
-    st.markdown('<div class="section-title">4 &middot; Risk Monitor</div>', unsafe_allow_html=True)
+if page == "⚠️ 4 · Risk Monitor":
+    st.markdown('<div class="section-title">⚠️ 4 &middot; Risk Monitor</div>', unsafe_allow_html=True)
 
     if risks:
         risk_col1, risk_col2 = st.columns([1.3, 1])
@@ -737,7 +734,7 @@ if page == "4 · Risk Monitor":
                 labels=risk_severity_counts.index, values=risk_severity_counts.values,
                 marker=dict(colors=["#E14B4B", "#306FDE", "#1EABA3"]), hole=0.6,
             )])
-            rfig.update_layout(title="Risk Severity Split")
+            rfig.update_layout(title="⚠️ Risk Severity Split")
             st.plotly_chart(plotly_theme(rfig, height=300), use_container_width=True)
     else:
         st.warning(
@@ -749,10 +746,10 @@ if page == "4 · Risk Monitor":
 # =========================================================
 # SECTION 5: Trend Monitor
 # =========================================================
-if page == "5 · Trend Monitor":
+if page == "📊 5 · Trend Monitor":
 
     st.markdown(
-        '<div class="section-title">5 · Trend Monitor</div>',
+        '<div class="section-title">📊 5 · Trend Monitor</div>',
         unsafe_allow_html=True
     )
 
@@ -836,8 +833,8 @@ if page == "5 · Trend Monitor":
 # =========================================================
 # SECTION 6: Sentiment Analysis
 # =========================================================
-if page == "6 · Sentiment Analysis":
-    st.markdown('<div class="section-title">5 &middot; Sentiment Analysis</div>', unsafe_allow_html=True)
+if page == "💬 6 · Sentiment Analysis":
+    st.markdown('<div class="section-title">💬 6 &middot; Sentiment Analysis</div>', unsafe_allow_html=True)
     st.caption(f"Sentiment scored live by {OLLAMA_MODEL} across a sample of recent articles.")
 
     with st.spinner(f"Scoring sentiment via {OLLAMA_MODEL}..."):
@@ -864,7 +861,7 @@ if page == "6 · Sentiment Analysis":
         gauge = go.Figure(go.Indicator(
             mode="gauge+number",
             value=net_score,
-            title={"text": "Net Sentiment Index"},
+            title={"text": "🌡️ Net Sentiment Index"},
             gauge={
                 "axis": {"range": [-100, 100]},
                 "bar": {"color": PALETTE["Trend"]},
@@ -878,7 +875,7 @@ if page == "6 · Sentiment Analysis":
         st.plotly_chart(plotly_theme(gauge, height=270, showlegend=False), use_container_width=True)
 
     with sent_col3:
-        st.markdown('<span class="eyebrow">SAMPLE CLASSIFICATIONS</span>', unsafe_allow_html=True)
+        st.markdown('<span class="eyebrow">🔎 SAMPLE CLASSIFICATIONS</span>', unsafe_allow_html=True)
         for s in sentiment_results[:4]:
             kind = {"Positive": "low", "Negative": "high", "Neutral": "medium"}.get(s["sentiment"], "medium")
             st.markdown(f"""
@@ -888,13 +885,13 @@ if page == "6 · Sentiment Analysis":
             </div>
             """, unsafe_allow_html=True)
 
-    st.markdown('<span class="eyebrow">PUBLIC SENTIMENT (PROXY)</span>', unsafe_allow_html=True)
+    st.markdown('<span class="eyebrow">👥 PUBLIC SENTIMENT (PROXY)</span>', unsafe_allow_html=True)
     st.caption(
         "No direct public/social source (Reddit, reviews, forums) is in the collection "
         "pipeline yet — only press/news sources. The chart above reflects news sentiment "
         "only. Add a community source to populate true public sentiment separately."
     )
-    st.markdown('<span class="eyebrow">SENTIMENT TREND</span>', unsafe_allow_html=True)
+    st.markdown('<span class="eyebrow">📉 SENTIMENT TREND</span>', unsafe_allow_html=True)
     st.caption(
         "Trend-over-time needs normalized published_at timestamps across all three "
         "sources — currently only NewsAPI provides them consistently."
@@ -903,8 +900,8 @@ if page == "6 · Sentiment Analysis":
 # =========================================================
 # SECTION 7: Strategic Recommendations
 # =========================================================
-if page == "7 · Strategic Recommendations":
-    st.markdown('<div class="section-title">6 &middot; Strategic Recommendations</div>', unsafe_allow_html=True)
+if page == "🎯 7 · Strategic Recommendations":
+    st.markdown('<div class="section-title">🎯 7 &middot; Strategic Recommendations</div>', unsafe_allow_html=True)
 
     if opportunities:
         overall_risk_note = (
@@ -914,7 +911,16 @@ if page == "7 · Strategic Recommendations":
         rec_col1, rec_col2 = st.columns([1.3, 1])
 
         with rec_col1:
+            seen = set()
+
             for o in sorted(opportunities, key=lambda x: -x["confidence_score"]):
+
+                rec_key = o["title"]
+
+                if rec_key in seen:
+                    continue
+
+                seen.add(rec_key)
                 meta = (
                     f"{_badge('PRIORITY: ' + o['impact_level'].upper(), o['impact_level'].lower())} "
                     f"{_badge(o['confidence'].upper() + ' CONFIDENCE', 'conf-' + o['confidence'])}"
@@ -939,7 +945,7 @@ if page == "7 · Strategic Recommendations":
                 marker_color=["#E14B4B" if p == "High" else "#306FDE" if p == "Medium" else "#1EABA3"
                               for p in priority_counts.index],
             )])
-            pfig.update_layout(title="Recommendation Priority Mix")
+            pfig.update_layout(title="🎯 Recommendation Priority Mix")
             st.plotly_chart(plotly_theme(pfig, height=300, showlegend=False), use_container_width=True)
     else:
         st.write("No recommendations generated yet.")
@@ -947,10 +953,10 @@ if page == "7 · Strategic Recommendations":
 # =========================================================
 # SECTION 8: CEO Briefing
 # =========================================================
-if page == "8 · CEO Briefing":
-    st.markdown('<div class="section-title">7 &middot; CEO Briefing</div>', unsafe_allow_html=True)
+if page == "🧑‍💼 8 · CEO Briefing":
+    st.markdown('<div class="section-title">🧑‍💼 8 &middot; CEO Briefing</div>', unsafe_allow_html=True)
 
-    if st.button("Generate Executive Briefing"):
+    if st.button("⚡Generate Executive Briefing"):
         with st.spinner(f"Asking {OLLAMA_MODEL} to draft the briefing..."):
             briefing = generate_ceo_briefing(
                 opportunity_titles=[o["title"] for o in opportunities],
