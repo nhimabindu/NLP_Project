@@ -599,9 +599,10 @@ with st.sidebar:
             "2 · Market Intelligence",
             "3 · Opportunity Monitor",
             "4 · Risk Monitor",
-            "5 · Sentiment Analysis",
-            "6 · Strategic Recommendations",
-            "7 · CEO Briefing",
+            "5 · Trend Monitor",
+            "6 · Sentiment Analysis",
+            "7 · Strategic Recommendations",
+            "8 · CEO Briefing",
         ],
         label_visibility="collapsed",
     )
@@ -746,9 +747,96 @@ if page == "4 · Risk Monitor":
         )
 
 # =========================================================
-# SECTION 5: Sentiment Analysis
+# SECTION 5: Trend Monitor
 # =========================================================
-if page == "5 · Sentiment Analysis":
+if page == "5 · Trend Monitor":
+
+    st.markdown(
+        '<div class="section-title">5 · Trend Monitor</div>',
+        unsafe_allow_html=True
+    )
+
+    if trends:
+
+        trend_col1, trend_col2 = st.columns([1.3,1])
+
+        with trend_col1:
+
+            for t in sorted(
+                trends,
+                key=lambda x: -x["confidence_score"]
+            ):
+
+                meta = (
+                    f"{_badge(t['impact_level'] + ' IMPACT', t['impact_level'].lower())} "
+                    f"{_badge(t['confidence'].upper() + ' CONF', 'conf-' + t['confidence'])}"
+                )
+
+                render_intel_card(
+                    "Trend",
+                    t["title"],
+                    meta
+                )
+
+        with trend_col2:
+
+            trend_names = [
+                t["category"].replace("_"," ").title()
+                for t in trends
+            ]
+
+            trend_scores = [
+                t["confidence_score"]
+                for t in trends
+            ]
+
+            fig = go.Figure(
+                data=[
+                    go.Bar(
+                        x=trend_names,
+                        y=trend_scores,
+                        marker_color="#1EABA3"
+                    )
+                ]
+            )
+
+            fig.update_layout(
+                title="Emerging Trend Strength"
+            )
+
+            st.plotly_chart(
+                plotly_theme(
+                    fig,
+                    height=320,
+                    showlegend=False
+                ),
+                use_container_width=True
+            )
+
+        with st.expander("View Trend Evidence"):
+
+            for t in trends:
+
+                st.markdown(
+                    f"**{t['title']}**"
+                )
+
+                for ev in t["evidence"][:3]:
+
+                    st.caption(
+                        f"- {ev[:150]}..."
+                    )
+
+    else:
+
+        st.info(
+            "No strong trends detected."
+        )
+
+# =========================================================
+# SECTION 6: Sentiment Analysis
+# =========================================================
+if page == "6 · Sentiment Analysis":
     st.markdown('<div class="section-title">5 &middot; Sentiment Analysis</div>', unsafe_allow_html=True)
     st.caption(f"Sentiment scored live by {OLLAMA_MODEL} across a sample of recent articles.")
 
@@ -813,9 +901,9 @@ if page == "5 · Sentiment Analysis":
     )
 
 # =========================================================
-# SECTION 6: Strategic Recommendations
+# SECTION 7: Strategic Recommendations
 # =========================================================
-if page == "6 · Strategic Recommendations":
+if page == "7 · Strategic Recommendations":
     st.markdown('<div class="section-title">6 &middot; Strategic Recommendations</div>', unsafe_allow_html=True)
 
     if opportunities:
@@ -857,9 +945,9 @@ if page == "6 · Strategic Recommendations":
         st.write("No recommendations generated yet.")
 
 # =========================================================
-# SECTION 7: CEO Briefing
+# SECTION 8: CEO Briefing
 # =========================================================
-if page == "7 · CEO Briefing":
+if page == "8 · CEO Briefing":
     st.markdown('<div class="section-title">7 &middot; CEO Briefing</div>', unsafe_allow_html=True)
 
     if st.button("Generate Executive Briefing"):
