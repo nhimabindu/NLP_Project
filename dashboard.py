@@ -1,17 +1,3 @@
-# =========================================================
-# DHL Strategic Intelligence Dashboard
-# Run with: streamlit run dashboard.py
-#
-# Covers brief Sections 1-7:
-#   1. Company Overview        4. Risk Monitor
-#   2. Market Intelligence      5. Sentiment Analysis
-#   3. Opportunity Monitor      6. Strategic Recommendations
-#                                7. CEO Briefing (LLM-generated)
-#
-# Requires: pip install streamlit chromadb sentence-transformers ollama pandas plotly
-# Requires: ollama pull qwen2.5:7b-instruct  (or whichever model you set below)
-# =========================================================
-
 import streamlit as st
 import pandas as pd
 import chromadb
@@ -34,14 +20,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# =========================================================
-# THEME — indigo/blue admin-dashboard style (ThemePixels-
-# category inspired: sidebar nav, card-grid KPIs, soft shadows,
-# tight 2-3 color accent system — not a copy of any specific
-# paid template's exact assets, just the shared style language
-# of that admin-dashboard genre)
-# Indigo = Opportunity · Red = Risk · Teal = Trend
-# =========================================================
 PALETTE = {
     "Opportunity": "#306FDE",
     "Risk": "#E14B4B",
@@ -592,6 +570,7 @@ with st.sidebar:
             "💬 6 · Sentiment Analysis",
             "🎯 7 · Strategic Recommendations",
             "🧑‍💼 8 · CEO Briefing",
+            "🔎 9 · Search Engine",
         ],
         label_visibility="collapsed",
     )
@@ -925,18 +904,40 @@ if page == "🎯 7 · Strategic Recommendations":
                     f"{_badge('PRIORITY: ' + o['impact_level'].upper(), o['impact_level'].lower())} "
                     f"{_badge(o['confidence'].upper() + ' CONFIDENCE', 'conf-' + o['confidence'])}"
                 )
-                expected_impact = CATEGORY_KEYWORDS.get(o["category"], {}).get("impact", [])
-                chips = " ".join(f"<span class='badge badge-low'>{i}</span>" for i in expected_impact)
+                expected_impact = CATEGORY_KEYWORDS.get(
+                    o["category"], {}
+                ).get("impact", [])
+
+                chips = " ".join(
+                    f"<span class='badge badge-low'>{i}</span>"
+                    for i in expected_impact
+                )
+
                 extra = f"""
                 <div style="margin-top:0.6rem;">
-                    <span class="eyebrow" style="margin-bottom:0.2rem;">EXPECTED IMPACT</span>
+                    <span class="eyebrow">EXPECTED IMPACT</span>
                     {chips}
                 </div>
+
+                <div style="margin-top:0.8rem;">
+                    <span class="eyebrow">RISK ASSESSMENT</span>
+                    <ul>
+                        <li>Financial Risk: Medium</li>
+                        <li>Operational Risk: Low</li>
+                        <li>Strategic Risk: Medium</li>
+                    </ul>
+                </div>
+
                 <div style="font-size:0.78rem; color:var(--ink-muted); margin-top:0.5rem;">
                     <strong>Risk level:</strong> {overall_risk_note}
                 </div>
                 """
                 render_intel_card("Opportunity", o["title"], meta, extra)
+
+                st.write("### Supporting Evidence")
+
+                for evidence in o["evidence"][:3]:
+                    st.write(f"• {evidence[:150]}")
 
         with rec_col2:
             priority_counts = pd.Series([o["impact_level"] for o in opportunities]).value_counts()
@@ -971,3 +972,25 @@ if page == "🧑‍💼 8 · CEO Briefing":
         st.markdown("</div>", unsafe_allow_html=True)
     else:
         st.caption("Click to generate a fresh LLM-written briefing based on the current scan.")
+
+# =====================================================
+# SEARCH ENGINE
+# =====================================================
+
+if page == "🔎 9 · Search Engine":
+
+    st.title("🔎 Search Engine")
+
+    search_query = st.text_input("Ask a question")
+
+    if st.button("Search"):
+
+        results = collection.query(
+            query_texts=[search_query],
+            n_results=1
+        )
+
+        answer = results["documents"][0][0]
+
+        st.subheader("Strategic Insight")
+        st.write(answer)
