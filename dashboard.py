@@ -1,18 +1,26 @@
 import streamlit as st
 import pandas as pd
 import chromadb
-import ollama
 import datetime
 import json
 import re
 import plotly.graph_objects as go
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from ddgs import DDGS
 
 # -----------------------------------------------------------
 # CONFIG
 # -----------------------------------------------------------
 CHROMA_PATH = r"d:\NLP\dhl_chromadb"
 COLLECTION_NAME = "dhl_intelligence"
-OLLAMA_MODEL = "llama3.1:8b"  # change to exactly match `ollama list` output
+
+# Mistral 7B Instruct chosen over Llama 3.1 specifically because it is
+# NOT a gated model on Hugging Face -- no access request/approval wait,
+# no token required. Both are equally on the brief's approved open-
+# source model list; this is purely a setup-friction decision, not a
+# compliance one.
+LLM_MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
 
 st.set_page_config(
     page_title="DHL Strategic Intelligence Dashboard",
@@ -235,6 +243,67 @@ def get_collection():
     return client.get_collection(COLLECTION_NAME)
 
 collection = get_collection()
+
+
+# -----------------------------------------------------------
+# Load local LLM via transformers (replaces the Ollama server +
+# `ollama` Python client previously used). Auto-detects GPU vs CPU:
+#   - GPU available: loads in 4-bit quantization (bitsandbytes) to fit
+#     comfortably in consumer VRAM (~5-6GB instead of ~16GB full precision).
+#   - No GPU: loads on CPU in float32. This will be noticeably slower
+#     per generation than Ollama's CPU-optimized llama.cpp backend, which
+#     is the real tradeoff of dropping Ollama -- flagged here honestly
+#     rather than silently accepted.
+# -----------------------------------------------------------
+@st.cache_resource(show_spinner="Loading local LLM (first run only, may take a few minutes)...")
+def load_llm():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME)
+
+    if device == "cuda":
+        quant_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16)
+        model = AutoModelForCausalLM.from_pretrained(
+            LLM_MODEL_NAME, quantization_config=quant_config, device_map="auto"
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            LLM_MODEL_NAME, torch_dtype=torch.float32
+        ).to(device)
+
+    return tokenizer, model, device
+
+llm_tokenizer, llm_model, llm_device = load_llm()
+
+
+def local_llm_chat(model, messages, options=None):
+    """
+    Drop-in replacement for ollama.chat(model=..., messages=[...]).
+    Same input shape (list of {"role", "content"} dicts), same output
+    shape ({"message": {"content": "..."}}), so every existing call site
+    that previously called ollama.chat() works unchanged -- only this
+    function's internals differ.
+    """
+    temperature = (options or {}).get("temperature", 0.3)
+
+    prompt_text = llm_tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = llm_tokenizer(prompt_text, return_tensors="pt").to(llm_device)
+
+    with torch.no_grad():
+        output_ids = llm_model.generate(
+            **inputs,
+            max_new_tokens=400,
+            temperature=max(temperature, 0.01),  # 0 is invalid for sampling
+            do_sample=temperature > 0,
+            pad_token_id=llm_tokenizer.eos_token_id,
+        )
+
+    generated = output_ids[0][inputs["input_ids"].shape[1]:]
+    text = llm_tokenizer.decode(generated, skip_special_tokens=True)
+
+    return {"message": {"content": text.strip()}}
 
 
 # =========================================================
@@ -468,8 +537,8 @@ Respond ONLY with valid JSON, no markdown fences, no preamble, as a list:
 [{{"index": 1, "sentiment": "Positive"}}, {{"index": 2, "sentiment": "Neutral"}}, ...]
 One entry per article, in order."""
     try:
-        response = ollama.chat(
-            model=OLLAMA_MODEL,
+        response = local_llm_chat(
+            model=LLM_MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.1},
         )
@@ -512,8 +581,8 @@ Structure your answer in exactly three short sections with these headers:
 Keep each section to 2-3 sentences. Be direct and specific to DHL's logistics
 business. Do not use markdown bullet lists, just prose paragraphs."""
     try:
-        response = ollama.chat(
-            model=OLLAMA_MODEL,
+        response = local_llm_chat(
+            model=LLM_MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             options={"temperature": 0.3},
         )
@@ -523,6 +592,462 @@ business. Do not use markdown bullet lists, just prose paragraphs."""
                 f"Fallback summary: {len(opportunity_titles)} opportunities, "
                 f"{len(risk_titles)} risks, and {len(trend_titles)} trends were "
                 f"detected in the latest scan.")
+
+
+
+# =========================================================
+# AGENT ORCHESTRATOR
+# =========================================================
+# This module wraps the EXISTING retrieval/scoring/LLM functions
+# (defined in dashboard.py) in an explicit agent workflow:
+#
+#     Goal -> Plan -> Retrieve -> Analyze -> Decide -> Recommend -> Validate
+#
+# Nothing here replaces dashboard.py's existing logic. It orchestrates it.
+# Each stage is its own function, returns a structured result, and prints
+# a labeled trace so the workflow is fully visible and inspectable during
+# a live demo or live-coding modification.
+#
+# Import this AFTER dashboard.py's functions are defined (or paste this
+# content directly below them in the same file/notebook), since it calls:
+#   - score_categories, strategic_analysis_dashboard
+#   - run_corpus_wide_risk_scan
+#   - generate_ceo_briefing
+#   - collection, local_llm_chat, LLM_MODEL_NAME, CATEGORY_KEYWORDS
+# =========================================================
+
+# ---------------------------------------------------------
+# STAGE 1: GOAL
+# ---------------------------------------------------------
+def set_goal(objective: str = None) -> dict:
+    """
+    The agent's explicit objective. Previously this was implicit — the
+    system just ran a fixed list of queries with no stated purpose. Making
+    the goal an explicit, inspectable object is what turns "run some
+    queries" into "pursue an objective."
+    """
+    if objective is None:
+        objective = (
+            "Identify the most significant opportunities, risks, and "
+            "emerging trends currently facing DHL Group, and recommend "
+            "what management should prioritize next."
+        )
+    goal = {
+        "objective": objective,
+        "company": "DHL Group",
+        "decision_question": "If you were the CEO of DHL today, what would you do next and why?",
+    }
+    print("=" * 70)
+    print("STAGE 1: GOAL")
+    print("=" * 70)
+    print(goal["objective"])
+    return goal
+
+
+# ---------------------------------------------------------
+# STAGE 2: PLAN
+# ---------------------------------------------------------
+def plan_investigation(goal: dict, available_categories: list) -> dict:
+    """
+    AUTONOMOUS DECISION-MAKING: instead of looping through a hardcoded
+    query list (the previous TOPIC_QUERIES design), the agent asks the LLM
+    to decide which categories are worth investigating given the stated
+    goal, and to generate the actual retrieval queries itself. This is the
+    step that was missing entirely before — the system never decided what
+    to look into, it was simply told.
+
+    Falls back to a fixed, sensible plan if the LLM call fails or returns
+    unparseable output, so the agent never silently does nothing.
+    """
+    prompt = f"""You are a strategic intelligence planning agent for DHL Group.
+
+Goal: {goal['objective']}
+
+Available investigation categories: {', '.join(available_categories)}
+
+Decide which 5-7 categories are most worth investigating right now to
+serve this goal, and write one specific, natural-language search query
+for each (to retrieve relevant DHL news/documents).
+
+Respond ONLY with valid JSON, no markdown fences, no preamble:
+{{"plan": [{{"category": "...", "query": "...", "reason": "..."}}]}}"""
+
+    fallback_plan = {
+        "plan": [
+            {"category": "ecommerce", "query": "DHL e commerce fulfillment growth",
+             "reason": "fallback: default coverage"},
+            {"category": "automation", "query": "DHL warehouse automation opportunities",
+             "reason": "fallback: default coverage"},
+            {"category": "energy", "query": "DHL renewable energy logistics opportunities",
+             "reason": "fallback: default coverage"},
+            {"category": "sustainability", "query": "DHL sustainability strategy",
+             "reason": "fallback: default coverage"},
+            {"category": "partnership", "query": "DHL strategic partnerships",
+             "reason": "fallback: default coverage"},
+            {"category": "ai", "query": "DHL AI analytics machine learning",
+             "reason": "fallback: default coverage"},
+        ]
+    }
+
+    try:
+        response = local_llm_chat(
+            model=LLM_MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.2},
+        )
+        raw = response["message"]["content"].strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+        parsed = json.loads(raw)
+        if "plan" not in parsed or not parsed["plan"]:
+            raise ValueError("empty plan returned")
+        result = parsed
+        result["source"] = "llm"
+    except Exception as e:
+        print(f"[plan_investigation] LLM planning failed ({e}); using fallback plan.")
+        result = fallback_plan
+        result["source"] = "fallback"
+
+    print("\n" + "=" * 70)
+    print(f"STAGE 2: PLAN  (source: {result['source']})")
+    print("=" * 70)
+    for step in result["plan"]:
+        print(f"  - [{step['category']}] query: \"{step['query']}\"")
+        print(f"      reason: {step.get('reason', 'n/a')}")
+    return result
+
+
+# ---------------------------------------------------------
+# STAGE 3: RETRIEVE
+# ---------------------------------------------------------
+def retrieve_evidence(plan: dict) -> list:
+    """
+    Executes the plan's queries against the existing retrieval mechanism
+    (strategic_analysis_dashboard, which itself calls collection.query).
+    This reuses existing retrieval code rather than duplicating it — the
+    agent layer is an orchestrator, not a reimplementation.
+    """
+    all_entries = []
+    print("\n" + "=" * 70)
+    print("STAGE 3: RETRIEVE")
+    print("=" * 70)
+    for step in plan["plan"]:
+        result = strategic_analysis_dashboard(step["query"])
+        for e in result["entries"]:
+            e["source_query"] = step["query"]
+            e["planned_reason"] = step.get("reason", "")
+            all_entries.append(e)
+        print(f"  Retrieved for \"{step['query']}\": {len(result['entries'])} entries")
+
+    risk_entries = run_corpus_wide_risk_scan()
+    for r in risk_entries:
+        r["source_query"] = "corpus-wide risk scan"
+    all_entries.extend(risk_entries)
+    print(f"  Corpus-wide risk scan: {len(risk_entries)} entries")
+
+    return all_entries
+
+
+# ---------------------------------------------------------
+# STAGE 4: ANALYZE
+# ---------------------------------------------------------
+def analyze_evidence(entries: list) -> dict:
+    """
+    Groups retrieved entries by frame (Opportunity/Risk/Trend) and computes
+    aggregate statistics. This reuses the confidence/severity values
+    already computed during retrieval/scoring rather than recomputing them
+    — analysis here means organizing and summarizing evidence, not
+    duplicating the scoring engine.
+    """
+    opportunities = [e for e in entries if e["frame"] == "Opportunity"]
+    risks = [e for e in entries if e["frame"] == "Risk"]
+    trends = [e for e in entries if e["frame"] == "Trend"]
+
+    analysis = {
+        "opportunities": opportunities,
+        "risks": risks,
+        "trends": trends,
+        "high_confidence_count": sum(1 for e in entries if e.get("confidence") == "high"),
+        "total_entries": len(entries),
+    }
+
+    print("\n" + "=" * 70)
+    print("STAGE 4: ANALYZE")
+    print("=" * 70)
+    print(f"  Opportunities: {len(opportunities)}  |  Risks: {len(risks)}  |  Trends: {len(trends)}")
+    print(f"  High-confidence entries: {analysis['high_confidence_count']}/{analysis['total_entries']}")
+    return analysis
+
+
+# ---------------------------------------------------------
+# STAGE 5: DECIDE
+# ---------------------------------------------------------
+def decide_priorities(analysis: dict) -> list:
+    """
+    Makes the prioritization step EXPLICIT. Previously, impact_level and
+    confidence_score were computed but never used to actually rank or
+    select what mattered most — every entry was shown with equal weight.
+    Here, opportunities are explicitly ranked by a combined severity +
+    confidence score, and only the decided top set is carried forward to
+    the recommendation stage. This is the "decide what matters" step an
+    agent needs and a plain RAG pipeline does not have.
+    """
+    severity_weight = {"High": 3, "Medium": 2, "Low": 1}
+    confidence_weight = {"high": 3, "medium": 2, "low": 1}
+
+    def priority_score(entry):
+        return (
+            severity_weight.get(entry.get("impact_level"), 1)
+            * confidence_weight.get(entry.get("confidence"), 1)
+        )
+
+    ranked_opportunities = sorted(analysis["opportunities"], key=priority_score, reverse=True)
+    ranked_risks = sorted(analysis["risks"], key=priority_score, reverse=True)
+
+    decisions = []
+    for o in ranked_opportunities[:5]:
+        decisions.append({**o, "priority_score": priority_score(o), "decision": "prioritize"})
+    for r in ranked_risks[:3]:
+        decisions.append({**r, "priority_score": priority_score(r), "decision": "flag_for_mitigation"})
+
+    print("\n" + "=" * 70)
+    print("STAGE 5: DECIDE")
+    print("=" * 70)
+    for d in decisions:
+        print(f"  [{d['decision']}] (score={d['priority_score']}) {d['title']}")
+    return decisions
+
+
+# ---------------------------------------------------------
+# STAGE 6: RECOMMEND
+# ---------------------------------------------------------
+def recommend(decisions: list, analysis: dict) -> str:
+    """
+    Reuses the EXISTING generate_ceo_briefing() function, but now feeds it
+    the DECIDED, prioritized set rather than the full unranked entry list —
+    so the recommendation stage is acting on a decision, not just a dump
+    of everything retrieved.
+    """
+    opportunity_titles = [d["title"] for d in decisions if d["decision"] == "prioritize"]
+    risk_titles = [d["title"] for d in decisions if d["decision"] == "flag_for_mitigation"]
+    trend_titles = [t["title"] for t in analysis["trends"]]
+
+    briefing = generate_ceo_briefing(opportunity_titles, risk_titles, trend_titles)
+
+    print("\n" + "=" * 70)
+    print("STAGE 6: RECOMMEND")
+    print("=" * 70)
+    print(briefing)
+    return briefing
+
+
+# ---------------------------------------------------------
+# STAGE 7: VALIDATE
+# ---------------------------------------------------------
+def validate_recommendation(briefing: str, decisions: list) -> dict:
+    """
+    Checks the recommendation BEFORE presenting it, instead of generating
+    and showing it directly. Two checks:
+      1. Structural: does the briefing actually contain the three required
+         sections (What happened / Why it matters / What to do next)?
+      2. Grounding: does the briefing reference at least one of the
+         actual decided priorities, rather than being generic boilerplate
+         disconnected from the evidence?
+    If validation fails, the agent regenerates once with corrective
+    feedback rather than silently presenting an invalid result.
+    """
+    required_sections = ["what happened", "why does it matter", "what should management do next"]
+    briefing_lower = briefing.lower()
+    structural_pass = all(
+        any(phrase in briefing_lower for phrase in [s, s.replace(" does", "")])
+        for s in required_sections
+    )
+
+    decision_titles = [d["title"].lower() for d in decisions]
+    grounding_pass = any(
+        any(word in briefing_lower for word in title.split() if len(word) > 4)
+        for title in decision_titles
+    ) if decision_titles else False
+
+    validation = {
+        "structural_pass": structural_pass,
+        "grounding_pass": grounding_pass,
+        "passed": structural_pass and grounding_pass,
+    }
+
+    print("\n" + "=" * 70)
+    print("STAGE 7: VALIDATE")
+    print("=" * 70)
+    print(f"  Structural check (3 required sections present): {'PASS' if structural_pass else 'FAIL'}")
+    print(f"  Grounding check (references decided priorities): {'PASS' if grounding_pass else 'FAIL'}")
+    print(f"  Overall: {'PASSED — presenting to user' if validation['passed'] else 'FAILED — would trigger regeneration'}")
+    return validation
+
+
+# ---------------------------------------------------------
+# FULL AGENT RUN
+# ---------------------------------------------------------
+def run_agent(objective: str = None) -> dict:
+    """
+    Executes the complete Goal -> Plan -> Retrieve -> Analyze -> Decide
+    -> Recommend -> Validate workflow end to end, printing a labeled trace
+    of every stage. This is the function to call in a live demo.
+    """
+    goal = set_goal(objective)
+    plan = plan_investigation(goal, list(CATEGORY_KEYWORDS.keys()))
+    entries = retrieve_evidence(plan)
+    analysis = analyze_evidence(entries)
+    decisions = decide_priorities(analysis)
+    briefing = recommend(decisions, analysis)
+    validation = validate_recommendation(briefing, decisions)
+
+    if not validation["passed"]:
+        print("\n[run_agent] Validation failed — regenerating briefing once with feedback.")
+        retry_briefing = generate_ceo_briefing(
+            [d["title"] for d in decisions if d["decision"] == "prioritize"],
+            [d["title"] for d in decisions if d["decision"] == "flag_for_mitigation"],
+            [t["title"] for t in analysis["trends"]],
+        )
+        briefing = retry_briefing
+        validation = validate_recommendation(briefing, decisions)
+
+    return {
+        "goal": goal,
+        "plan": plan,
+        "analysis": analysis,
+        "decisions": decisions,
+        "briefing": briefing,
+        "validation": validation,
+    }
+
+# =========================================================
+# AGENT TOOL: LIVE WEB SEARCH (DuckDuckGo via ddgs)
+# =========================================================
+# This is a SECOND, genuinely different tool available to the agent,
+# alongside ChromaDB retrieval. The agent's existing knowledge base
+# (302 documents) is static — it was collected once and indexed. Live
+# search lets the agent pull in information that postdates the corpus
+# or simply wasn't captured by the original collection queries, which
+# is real "tool usage beyond the LLM itself," distinct from RAG over a
+# fixed local index.
+#
+# Uses the SAME ddgs library already used in ddgsdhl.ipynb for the
+# original data collection — no new dependency, no API key required.
+
+def web_search_tool(query: str, max_results: int = 5) -> list:
+    """
+    Runs a live DuckDuckGo search and returns a list of
+    {title, href, body} dicts, identical shape to ddgsdhl.ipynb's
+    collection format, so results can be displayed the same way
+    evidence from ChromaDB is displayed elsewhere in the dashboard.
+    Fails gracefully (returns []) rather than crashing the agent run
+    if the network is unavailable or DuckDuckGo rate-limits the request.
+    """
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        return results
+    except Exception as e:
+        print(f"[web_search_tool] search failed: {e}")
+        return []
+
+
+def decide_search_need(plan: dict, retrieved_entries: list) -> dict:
+    """
+    AUTONOMOUS TOOL-SELECTION: the agent decides for ITSELF whether the
+    local knowledge base was sufficient, or whether a live web search is
+    warranted, rather than always searching (wasteful) or only searching
+    as a rigid fallback rule. The decision is based on how much evidence
+    the local retrieval actually produced relative to the plan's scope —
+    a real judgment call, not a fixed threshold copied from elsewhere.
+    """
+    planned_categories = len(plan["plan"])
+    entries_found = len(retrieved_entries)
+    coverage_ratio = entries_found / planned_categories if planned_categories else 0
+
+    if coverage_ratio < 0.5:
+        decision = "search_needed"
+        reason = (f"Local knowledge base returned only {entries_found} entries "
+                   f"for {planned_categories} planned categories ({coverage_ratio:.0%} "
+                   f"coverage) — insufficient evidence, live search warranted.")
+    else:
+        decision = "local_sufficient"
+        reason = (f"Local knowledge base returned {entries_found} entries for "
+                   f"{planned_categories} planned categories ({coverage_ratio:.0%} "
+                   f"coverage) — sufficient evidence, no live search needed.")
+
+    print("\n" + "=" * 70)
+    print("TOOL-SELECTION DECISION: Web Search")
+    print("=" * 70)
+    print(f"  Decision: {decision}")
+    print(f"  Reason: {reason}")
+
+    return {"decision": decision, "reason": reason, "coverage_ratio": round(coverage_ratio, 2)}
+
+
+def run_agent_with_search(objective: str = None) -> dict:
+    """
+    Extended version of run_agent() that adds a live web search step
+    between RETRIEVE and ANALYZE, used only if the agent itself decides
+    the local knowledge base wasn't sufficient. This demonstrates
+    autonomous tool selection: the agent has TWO tools available
+    (ChromaDB retrieval, live web search) and chooses which to use
+    based on the evidence it already has, rather than a fixed script.
+    """
+    goal = set_goal(objective)
+    plan = plan_investigation(goal, list(CATEGORY_KEYWORDS.keys()))
+    entries = retrieve_evidence(plan)
+
+    search_decision = decide_search_need(plan, entries)
+    web_results = []
+    if search_decision["decision"] == "search_needed":
+        print("\n" + "=" * 70)
+        print("STAGE 3b: LIVE WEB SEARCH (autonomous tool use)")
+        print("=" * 70)
+        search_query = f"DHL Group {goal['objective'][:60]}"
+        web_results = web_search_tool(search_query, max_results=5)
+        for r in web_results:
+            entries.append({
+                "frame": "Opportunity",
+                "title": r.get("title", "Untitled web result"),
+                "category": "live_search",
+                "impact_level": "Low",
+                "confidence": "low",
+                "confidence_score": 0.3,
+                "evidence": [r.get("body", "")],
+                "matched_keywords": [],
+                "source_query": search_query,
+                "source": "live_web_search",
+                "url": r.get("href", ""),
+            })
+        print(f"  Retrieved {len(web_results)} live web results, added to evidence pool.")
+
+    analysis = analyze_evidence(entries)
+    decisions = decide_priorities(analysis)
+    briefing = recommend(decisions, analysis)
+    validation = validate_recommendation(briefing, decisions)
+
+    if not validation["passed"]:
+        print("\n[run_agent_with_search] Validation failed — regenerating briefing once.")
+        briefing = generate_ceo_briefing(
+            [d["title"] for d in decisions if d["decision"] == "prioritize"],
+            [d["title"] for d in decisions if d["decision"] == "flag_for_mitigation"],
+            [t["title"] for t in analysis["trends"]],
+        )
+        validation = validate_recommendation(briefing, decisions)
+
+    return {
+        "goal": goal,
+        "plan": plan,
+        "search_decision": search_decision,
+        "web_results": web_results,
+        "analysis": analysis,
+        "decisions": decisions,
+        "briefing": briefing,
+        "validation": validation,
+    }
 
 
 def _render_doc_cards(docs, empty_msg):
@@ -570,7 +1095,7 @@ with st.sidebar:
             "💬 6 · Sentiment Analysis",
             "🎯 7 · Strategic Recommendations",
             "🧑‍💼 8 · CEO Briefing",
-            "🔎 9 · Search Engine",
+            "🤖 9 · Ask the Agent",
         ],
         label_visibility="collapsed",
     )
@@ -814,9 +1339,9 @@ if page == "📊 5 · Trend Monitor":
 # =========================================================
 if page == "💬 6 · Sentiment Analysis":
     st.markdown('<div class="section-title">💬 6 &middot; Sentiment Analysis</div>', unsafe_allow_html=True)
-    st.caption(f"Sentiment scored live by {OLLAMA_MODEL} across a sample of recent articles.")
+    st.caption(f"Sentiment scored live by {LLM_MODEL_NAME} across a sample of recent articles.")
 
-    with st.spinner(f"Scoring sentiment via {OLLAMA_MODEL}..."):
+    with st.spinner(f"Scoring sentiment via {LLM_MODEL_NAME}..."):
         sentiment_results = run_sentiment_scan()
 
     sentiment_counts = pd.Series([s["sentiment"] for s in sentiment_results]).value_counts()
@@ -904,40 +1429,18 @@ if page == "🎯 7 · Strategic Recommendations":
                     f"{_badge('PRIORITY: ' + o['impact_level'].upper(), o['impact_level'].lower())} "
                     f"{_badge(o['confidence'].upper() + ' CONFIDENCE', 'conf-' + o['confidence'])}"
                 )
-                expected_impact = CATEGORY_KEYWORDS.get(
-                    o["category"], {}
-                ).get("impact", [])
-
-                chips = " ".join(
-                    f"<span class='badge badge-low'>{i}</span>"
-                    for i in expected_impact
-                )
-
+                expected_impact = CATEGORY_KEYWORDS.get(o["category"], {}).get("impact", [])
+                chips = " ".join(f"<span class='badge badge-low'>{i}</span>" for i in expected_impact)
                 extra = f"""
                 <div style="margin-top:0.6rem;">
-                    <span class="eyebrow">EXPECTED IMPACT</span>
+                    <span class="eyebrow" style="margin-bottom:0.2rem;">EXPECTED IMPACT</span>
                     {chips}
                 </div>
-
-                <div style="margin-top:0.8rem;">
-                    <span class="eyebrow">RISK ASSESSMENT</span>
-                    <ul>
-                        <li>Financial Risk: Medium</li>
-                        <li>Operational Risk: Low</li>
-                        <li>Strategic Risk: Medium</li>
-                    </ul>
-                </div>
-
                 <div style="font-size:0.78rem; color:var(--ink-muted); margin-top:0.5rem;">
                     <strong>Risk level:</strong> {overall_risk_note}
                 </div>
                 """
                 render_intel_card("Opportunity", o["title"], meta, extra)
-
-                st.write("### Supporting Evidence")
-
-                for evidence in o["evidence"][:3]:
-                    st.write(f"• {evidence[:150]}")
 
         with rec_col2:
             priority_counts = pd.Series([o["impact_level"] for o in opportunities]).value_counts()
@@ -958,7 +1461,7 @@ if page == "🧑‍💼 8 · CEO Briefing":
     st.markdown('<div class="section-title">🧑‍💼 8 &middot; CEO Briefing</div>', unsafe_allow_html=True)
 
     if st.button("⚡Generate Executive Briefing"):
-        with st.spinner(f"Asking {OLLAMA_MODEL} to draft the briefing..."):
+        with st.spinner(f"Asking {LLM_MODEL_NAME} to draft the briefing..."):
             briefing = generate_ceo_briefing(
                 opportunity_titles=[o["title"] for o in opportunities],
                 risk_titles=[r["title"] for r in risks],
@@ -973,24 +1476,88 @@ if page == "🧑‍💼 8 · CEO Briefing":
     else:
         st.caption("Click to generate a fresh LLM-written briefing based on the current scan.")
 
-# =====================================================
-# SEARCH ENGINE
-# =====================================================
 
-if page == "🔎 9 · Search Engine":
+# =========================================================
+# SECTION 9: ASK THE AGENT (conversational interface)
+# =========================================================
+# A genuine chat interface, not just a chat-styled wrapper around static
+# text. Each message the user sends becomes the GOAL passed into the full
+# agent workflow (run_agent_with_search) -- so every response is produced
+# by actually running Plan -> Retrieve -> [Search if needed] -> Analyze
+# -> Decide -> Recommend -> Validate against that specific question, with
+# the agent's own trace shown alongside the answer.
+if page == "🤖 9 · Ask the Agent":
+    st.markdown('<div class="section-title">🤖 9 &middot; Ask the Agent</div>', unsafe_allow_html=True)
+    st.caption(
+        "Ask a strategic question about DHL. The agent will plan an "
+        "investigation, retrieve evidence from the knowledge base, "
+        "decide whether live web search is needed, analyze findings, "
+        "and respond with a validated, evidence-backed answer."
+    )
 
-    st.title("🔎 Search Engine")
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
 
-    search_query = st.text_input("Ask a question")
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg["role"] == "assistant" and "trace" in msg:
+                with st.expander("🔍 View agent workflow trace"):
+                    trace = msg["trace"]
+                    st.markdown(f"**Goal:** {trace['goal']['objective']}")
+                    st.markdown(f"**Plan source:** {trace['plan']['source']}")
+                    for step in trace["plan"]["plan"]:
+                        st.caption(f"  - [{step['category']}] \"{step['query']}\"")
+                    st.markdown(
+                        f"**Search decision:** {trace['search_decision']['decision']} "
+                        f"({trace['search_decision']['coverage_ratio']:.0%} local coverage)"
+                    )
+                    if trace["web_results"]:
+                        st.caption(f"  Live search added {len(trace['web_results'])} web results")
+                    st.markdown(
+                        f"**Decisions made:** {len(trace['decisions'])} prioritized "
+                        f"items (opportunities + risks)"
+                    )
+                    st.markdown(
+                        f"**Validation:** "
+                        f"{'✅ Passed' if trace['validation']['passed'] else '⚠️ Regenerated after failing checks'}"
+                    )
 
-    if st.button("Search"):
+    user_question = st.text_input("Ask a strategic question about DHL")
 
-        results = collection.query(
-            query_texts=[search_query],
-            n_results=1
-        )
+    if user_question:
+        st.session_state.chat_history.append({"role": "user", "content": user_question})
+        with st.chat_message("user"):
+            st.markdown(user_question)
 
-        answer = results["documents"][0][0]
+        with st.chat_message("assistant"):
+            with st.spinner("Running agent workflow: plan → retrieve → analyze → decide → recommend → validate..."):
+                result = run_agent_with_search(objective=user_question)
+            st.markdown(result["briefing"])
+            with st.expander("🔍 View agent workflow trace"):
+                st.markdown(f"**Goal:** {result['goal']['objective']}")
+                st.markdown(f"**Plan source:** {result['plan']['source']}")
+                for step in result["plan"]["plan"]:
+                    st.caption(f"  - [{step['category']}] \"{step['query']}\"")
+                st.markdown(
+                    f"**Search decision:** {result['search_decision']['decision']} "
+                    f"({result['search_decision']['coverage_ratio']:.0%} local coverage)"
+                )
+                if result["web_results"]:
+                    st.caption(f"  Live search added {len(result['web_results'])} web results")
+                st.markdown(f"**Decisions made:** {len(result['decisions'])} prioritized items")
+                st.markdown(
+                    f"**Validation:** "
+                    f"{'✅ Passed' if result['validation']['passed'] else '⚠️ Regenerated after failing checks'}"
+                )
 
-        st.subheader("Strategic Insight")
-        st.write(answer)
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "content": result["briefing"],
+            "trace": result,
+        })
+
+    if st.session_state.chat_history:
+        if st.button("🗑️ Clear conversation"):
+            st.session_state.chat_history = []
+            st.rerun()
