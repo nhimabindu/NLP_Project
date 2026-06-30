@@ -61,7 +61,7 @@ through an interactive, conversational dashboard.
                              v
 +-------------------------------------------------------------------+
 |                       LOCAL LLM (transformers)                    |
-|            Mistral 7B Instruct -- runs entirely on-device         |
+|            TinyLLama -- runs entirely on-device         |
 |   - Sentiment classification (structured JSON output)             |
 |   - Investigation planning (autonomous category/query selection)  |
 |   - Executive briefing generation                                 |
